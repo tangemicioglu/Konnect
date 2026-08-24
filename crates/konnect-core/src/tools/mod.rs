@@ -21,6 +21,7 @@ pub mod sch_bus;
 pub mod sch_components;
 pub mod sch_export;
 pub mod sch_hierarchy;
+pub mod sch_region;
 pub mod sch_wiring;
 pub mod schematic_builder;
 pub mod svg_import;
