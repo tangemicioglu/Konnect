@@ -29,7 +29,7 @@ use konnect_sexp::{
 use serde_json::json;
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "create_schematic",
             "Create a new blank .kicad_sch schematic file, on A4 unless another paper \
@@ -382,7 +382,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_schematic_view(args, ctx).await }
         ),
-    ]
+    ];
+    tools.extend(crate::tools::sch_graphics::tools());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
