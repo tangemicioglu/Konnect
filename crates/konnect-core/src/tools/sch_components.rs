@@ -1126,60 +1126,9 @@ async fn handle_move_connected(
 
 async fn handle_move_region(
     args: &serde_json::Value,
-    _ctx: &ToolContext,
+    ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let x1 = match require_f64(args, "x1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y1 = match require_f64(args, "y1") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let x2 = match require_f64(args, "x2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let y2 = match require_f64(args, "y2") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let dx = match require_f64(args, "dx") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-    let dy = match require_f64(args, "dy") {
-        Ok(v) => v,
-        Err(e) => return Ok(e),
-    };
-
-    let mut sch = cse::Schematic::load(&sch_path)?;
-
-    // Collect references of symbols within the bounding box
-    let refs_to_move: Vec<String> = sch
-        .symbols
-        .within_rectangle(x1, y1, x2, y2)
-        .iter()
-        .filter_map(|s| s.reference().map(String::from))
-        .collect();
-
-    let mut moved = Vec::new();
-    for reference in &refs_to_move {
-        if let Some(sym) = sch.symbols.by_reference_mut(reference) {
-            let (ox, oy) = sym.position();
-            let (nx, ny) = snap_point(ox + dx, oy + dy, 1.27);
-            sym.move_to(nx, ny);
-            moved.push(reference.clone());
-        }
-    }
-
-    sch.overwrite()?;
-
-    Ok(CallToolResult::json(&json!({
-        "moved_count": moved.len(),
-        "moved": moved
-    })))
+    crate::tools::sch_region::handle_move_region(args, ctx).await
 }
 
 async fn handle_annotate_schematic(
