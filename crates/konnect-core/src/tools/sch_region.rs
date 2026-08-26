@@ -13,6 +13,7 @@ use konnect_sexp::writer::{
     write_atomic_if_unchanged, SexpEdit,
 };
 use serde_json::{json, Map, Value};
+use std::io::Write;
 
 #[derive(Clone, Copy)]
 pub struct Box2 {
@@ -53,10 +54,10 @@ fn coord_span(block: &str, tag: &str) -> Option<(usize, usize)> {
     find_balanced_block(block, start)
 }
 
-fn coord(block: &str, tag: &str) -> Option<(f64, f64, f64)> {
+fn coord(block: &str, tag: &str) -> Option<(f64, f64, Option<f64>)> {
     let (start, end) = coord_span(block, tag)?;
     let n = konnect_sexp::parse_sexp(&block[start..end]).ok()?;
-    Some((n.get_f64(1)?, n.get_f64(2)?, n.get_f64(3).unwrap_or(0.0)))
+    Some((n.get_f64(1)?, n.get_f64(2)?, n.get_f64(3)))
 }
 
 fn fmt(value: f64) -> String {
@@ -96,7 +97,12 @@ fn translate_coord(
     edits.push(SexpEdit::replace(
         start,
         end,
-        translated_coord(tag, x + dx, y + dy, (tag == "at").then_some(rotation)),
+        translated_coord(
+            tag,
+            x + dx,
+            y + dy,
+            (tag == "at").then_some(rotation).flatten(),
+        ),
     ));
     Ok(())
 }
@@ -148,7 +154,7 @@ fn translate_block(block: &str, kind: &str, dx: f64, dy: f64) -> anyhow::Result<
                     edits.push(SexpEdit::replace(
                         property_start + at_start,
                         property_start + at_end,
-                        translated_coord("at", x + dx, y + dy, Some(rotation)),
+                        translated_coord("at", x + dx, y + dy, rotation),
                     ));
                 }
             }
@@ -330,6 +336,81 @@ pub fn move_region_content(
     ))
 }
 
+/// Validate a candidate in an isolated temporary file before it can replace
+/// the user's schematic. Structural parsing catches malformed S-expressions;
+/// KiCad's own PDF export is the loadability gate that catches native-schema
+/// defects such as an invalid coordinate arity. The temporary files are
+/// removed when this function returns.
+async fn validate_candidate(cli: &str, content: &str) -> Value {
+    let mut evidence = json!({
+        "structural_parse": { "ok": false },
+        "kicad_cli_export_pdf": { "ok": false },
+        "valid": false,
+    });
+
+    let root = match konnect_sexp::parse_sexp(content) {
+        Ok(root) => root,
+        Err(error) => {
+            evidence["structural_parse"] = json!({
+                "ok": false,
+                "error": error.to_string(),
+            });
+            return evidence;
+        }
+    };
+    if root.head() != Some("kicad_sch") {
+        evidence["structural_parse"] = json!({
+            "ok": false,
+            "error": "candidate root is not kicad_sch",
+        });
+        return evidence;
+    }
+    evidence["structural_parse"] = json!({ "ok": true });
+
+    let directory = match tempfile::tempdir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            evidence["kicad_cli_export_pdf"] = json!({
+                "ok": false,
+                "error": format!("cannot create validation directory: {error}"),
+            });
+            return evidence;
+        }
+    };
+    let staged = directory.path().join("move-region-candidate.kicad_sch");
+    let pdf = directory.path().join("move-region-candidate.pdf");
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::File::create(&staged)?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        evidence["kicad_cli_export_pdf"] = json!({
+            "ok": false,
+            "error": format!("cannot stage candidate: {error}"),
+        });
+        return evidence;
+    }
+
+    match crate::tools::cli::export_schematic_pdf(cli, &staged, &pdf).await {
+        Ok(()) => {
+            evidence["kicad_cli_export_pdf"] = json!({
+                "ok": true,
+                "output_bytes": std::fs::metadata(&pdf).map(|metadata| metadata.len()).unwrap_or(0),
+            });
+            evidence["valid"] = json!(true);
+        }
+        Err(error) => {
+            evidence["kicad_cli_export_pdf"] = json!({
+                "ok": false,
+                "error": error.to_string(),
+            });
+        }
+    }
+    evidence
+}
+
 pub async fn handle_move_region(
     args: &Value,
     _ctx: &ToolContext,
@@ -354,15 +435,72 @@ pub async fn handle_move_region(
     };
     let old = read_consistent(&path)?;
     let (new_content, summary) = move_region_content(&old, area, parsed[4], parsed[5])?;
-    write_atomic_if_unchanged(&path, &old, &new_content)?;
-    Ok(CallToolResult::json(&summary))
+    let validation = validate_candidate(&_ctx.config.kicad_cli, &new_content).await;
+    if !validation["valid"].as_bool().unwrap_or(false) {
+        let evidence = serde_json::to_string(&validation)?;
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::HandlerError {
+                reason: format!("move_region validation failed; evidence={evidence}"),
+            },
+            "move_region refused to replace the schematic; the original was preserved byte-for-byte",
+        ));
+    }
+
+    if let Err(error) = write_atomic_if_unchanged(&path, &old, &new_content) {
+        let evidence = serde_json::to_string(&validation)?;
+        return Ok(CallToolResult::error_kind(
+            crate::mcp::error::ToolErrorKind::HandlerError {
+                reason: format!("move_region commit failed; evidence={evidence}; error={error}"),
+            },
+            "move_region could not commit the validated candidate; the source was not replaced",
+        ));
+    }
+
+    let mut result = summary;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("validation".to_owned(), validation);
+    }
+    Ok(CallToolResult::json(&result))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::protocol::ToolContent;
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
+    use std::sync::Arc;
 
     const FIXTURE: &str = include_str!("../../tests/fixtures/move_region_native.kicad_sch");
+
+    fn args(path: &std::path::Path, x1: f64, y1: f64, x2: f64, y2: f64, dx: f64, dy: f64) -> Value {
+        json!({
+            "schematic": path.to_string_lossy(),
+            "x1": x1,
+            "y1": y1,
+            "x2": x2,
+            "y2": y2,
+            "dx": dx,
+            "dy": dy,
+        })
+    }
+
+    fn result_body(result: &CallToolResult) -> Value {
+        let ToolContent::Text { text } = &result.content[0] else {
+            panic!("move_region result was not text")
+        };
+        serde_json::from_str(text).expect("move_region result was not JSON")
+    }
+
+    fn test_context(kicad_cli: &str) -> ToolContext {
+        ToolContext::new(
+            ServerConfig {
+                kicad_cli: kicad_cli.to_owned(),
+                ..ServerConfig::default()
+            },
+            Arc::new(ToolRouter::new()),
+        )
+    }
 
     #[test]
     fn moves_complete_block_and_reports_boundary_wire() {
@@ -376,6 +514,10 @@ mod tests {
         assert!(out.contains("(xy 15 17)") && out.contains("(xy 25 17)"));
         assert!(out.contains("(at 20 27 0)"));
         assert!(out.contains("(at 35 47 0)"));
+        assert!(out.contains("(junction (at 25 17)"));
+        assert!(out.contains("(no_connect (at 27 29)"));
+        assert!(!out.contains("(junction (at 25 17 0)"));
+        assert!(!out.contains("(no_connect (at 27 29 0)"));
         assert!(out.contains("(start 15 17)") && out.contains("(end 45 47)"));
         assert!(out.contains("(uuid \"internal-wire\")"));
         assert!(out.contains("(uuid \"power-1\")"));
@@ -392,5 +534,85 @@ mod tests {
         assert_eq!(summary["moved_counts"]["symbol"], 1);
         assert_eq!(summary["skipped_count"], 1);
         assert_eq!(summary["skipped"][0]["uuid"], "boundary-wire");
+    }
+
+    #[tokio::test]
+    async fn handler_round_trips_native_fixture_through_kicad_and_preserves_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("move_region_native.kicad_sch");
+        std::fs::write(&schematic, FIXTURE).unwrap();
+        let context = test_context("kicad-cli");
+
+        let moved = handle_move_region(
+            &args(&schematic, 10.0, 10.0, 50.0, 50.0, 5.0, 7.0),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!moved.is_error, "move_region failed: {moved:?}");
+        let moved_body = result_body(&moved);
+        assert_eq!(moved_body["validation"]["valid"], true);
+        assert_eq!(moved_body["moved_counts"]["junction"], 1);
+        assert_eq!(moved_body["moved_counts"]["no_connect"], 1);
+        assert_eq!(moved_body["moved_counts"]["power_symbol"], 1);
+        assert_eq!(moved_body["moved_counts"]["rectangle"], 1);
+        assert_eq!(moved_body["moved_counts"]["text"], 1);
+        assert_eq!(moved_body["skipped"][0]["uuid"], "boundary-wire");
+
+        let after_move = std::fs::read_to_string(&schematic).unwrap();
+        for id in [
+            "internal-wire",
+            "boundary-wire",
+            "label-1",
+            "junction-1",
+            "no-connect-1",
+            "symbol-1",
+            "power-1",
+            "rect-1",
+            "text-1",
+        ] {
+            assert_eq!(
+                after_move.matches(&format!("(uuid \"{id}\")")).count(),
+                1,
+                "UUID {id} changed"
+            );
+        }
+        assert!(after_move.contains("(xy 5 25) (xy 60 25)"));
+        assert!(after_move.contains("(label \"SIG\""));
+        assert!(after_move.contains("(lib_id \"power:GND\")"));
+
+        let inverse = handle_move_region(
+            &args(&schematic, 15.0, 17.0, 55.0, 57.0, -5.0, -7.0),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!inverse.is_error, "inverse move_region failed: {inverse:?}");
+        assert_eq!(result_body(&inverse)["validation"]["valid"], true);
+        assert_eq!(std::fs::read_to_string(&schematic).unwrap(), FIXTURE);
+    }
+
+    #[tokio::test]
+    async fn validation_failure_preserves_original_bytes_and_reports_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let schematic = directory.path().join("move_region_native.kicad_sch");
+        std::fs::write(&schematic, FIXTURE).unwrap();
+        let before = std::fs::read(&schematic).unwrap();
+        let context = test_context("konnect-cli-that-does-not-exist");
+
+        let result = handle_move_region(
+            &args(&schematic, 10.0, 10.0, 50.0, 50.0, 5.0, 7.0),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_error);
+        let body = result_body(&result);
+        assert_eq!(body["error"]["kind"], "handler_error");
+        let reason = body["error"]["reason"].as_str().unwrap();
+        assert!(reason.contains("move_region validation failed"));
+        assert!(reason.contains("kicad_cli_export_pdf"));
+        assert_eq!(std::fs::read(&schematic).unwrap(), before);
     }
 }
